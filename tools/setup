@@ -1,0 +1,495 @@
+#!/bin/bash
+#
+# WireGuard Exit Node Configuration Script for Ubuntu
+#
+# This script is interactive and provides options to set up, uninstall,
+# or provide custom keys, including automatic backup of modified system files.
+# Features: Configurable Port, Optional IPv6, Automatic UFW/Firewalld rules.
+
+# --- Configuration Variables ---
+WG_INTERFACE="wg0"
+WG_SUBNET="10.0.0.0/24" 			# WireGuard internal IPv4 subnet
+WG_IP="10.0.0.1/24" 			# Server's internal IPv4 address
+CONFIG_FILE="/etc/wireguard/${WG_INTERFACE}.conf"
+FIRST_CLIENT_IP="10.0.0.2" 		# Starting IPv4 for the first client
+
+# Dynamic variables set via user input/detection
+ENABLE_IPV6=false 				# Flag to check if IPv6 is enabled
+WG_IPV6_PREFIX=""
+WG_IPV6_SUBNET=""
+WG_IPV6_IP=""
+FIRST_CLIENT_IPV6=""
+SERVER_PRIVATE_KEY=""
+SERVER_PUBLIC_KEY=""
+PUBLIC_INTERFACE=""
+SERVER_ENDPOINT=""
+WG_PORT="" 						# Variable to store user-defined port
+CLIENT_DIR="wg-clients"
+ORIGINAL_USER="${SUDO_USER:-root}"
+
+# --- Helper Functions ---
+
+# Check for root
+check_root() {
+	if [[ $EUID -ne 0 ]]; then
+		echo "Error: This script must be run as root or with sudo."
+		exit 1
+	fi
+}
+
+# Find the primary public-facing network interface (used for NAT)
+get_public_interface() {
+	# Get the interface used for the default route
+	PUBLIC_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n 1)
+	if [[ -z "$PUBLIC_INTERFACE" ]]; then
+		echo "Error: Could not determine the public network interface."
+		exit 1
+	fi
+	echo "Found public interface: $PUBLIC_INTERFACE"
+}
+
+# Handle key generation or import
+handle_key_generation() {
+	echo -e "\n[5/12] Handling WireGuard Server Keys..."
+	
+	echo "Choose an option for the server's private key:"
+	echo "1) Generate a new key pair (Recommended)."
+	echo "2) Provide an existing private key."
+	
+	local choice
+	read -r -p "Enter choice (1 or 2): " choice
+
+	case "$choice" in
+		1)
+			echo "Generating new server key pair..."
+			umask 077 # Secure file creation
+			SERVER_PRIVATE_KEY=$(wg genkey)
+			SERVER_PUBLIC_KEY=$(echo "$SERVER_PRIVATE_KEY" | wg pubkey)
+			echo "New keys generated successfully."
+			;;
+		2)
+			echo -e "\nPaste your existing WireGuard Private Key and press [ENTER]:"
+			read -r SERVER_PRIVATE_KEY
+			
+			# Validate key and generate public key
+			if SERVER_PUBLIC_KEY=$(echo "$SERVER_PRIVATE_KEY" | wg pubkey 2>/dev/null); then
+				echo "Private key accepted. Public key derived."
+			else
+				echo "Error: The provided private key is not a valid WireGuard key. Exiting."
+				exit 1
+			fi
+			;;
+		*)
+			echo "Invalid choice. Exiting."
+			exit 1
+			;;
+	esac
+}
+
+# Handle creation of configuration file backups
+handle_backups() {
+	echo -e "\n[6/12] Creating Backups..."
+
+	# Backup sysctl.conf (only the first time)
+	SYSCTL_BAK="/etc/sysctl.conf.wg_bak"
+	if [ ! -f "$SYSCTL_BAK" ]; then
+		cp /etc/sysctl.conf "$SYSCTL_BAK"
+		echo "Backed up /etc/sysctl.conf to $SYSCTL_BAK."
+	else
+		echo "/etc/sysctl.conf backup already exists. Skipping."
+	fi
+
+	# Backup existing wg0.conf if present (with timestamp)
+	if [ -f "$CONFIG_FILE" ]; then
+		TIMESTAMP=$(date +%Y%m%d%H%M%S)
+		WG_CONF_BAK="${CONFIG_FILE}.bak.${TIMESTAMP}"
+		mv "$CONFIG_FILE" "$WG_CONF_BAK"
+		echo "Backed up existing $CONFIG_FILE to $WG_CONF_BAK."
+	else
+		echo "No existing $CONFIG_FILE found. Skipping backup."
+	fi
+}
+
+# Uninstallation/Cleanup Function
+uninstall() {
+	echo -e "\n--- Starting WireGuard Uninstallation and Cleanup ---"
+	
+	# 1. Stop and disable service
+	echo "Stopping and disabling WireGuard service..."
+	systemctl stop wg-quick@${WG_INTERFACE} 2>/dev/null
+	systemctl disable wg-quick@${WG_INTERFACE} 2>/dev/null
+
+	# 2. Restore /etc/sysctl.conf
+	echo "Restoring IP forwarding settings..."
+	# Remove the specific IPv4 and IPv6 lines if they exist
+	sed -i '/^net.ipv4.ip_forward=1/d' /etc/sysctl.conf
+	sed -i '/^net.ipv6.conf.all.forwarding=1/d' /etc/sysctl.conf
+	sysctl -p 2>/dev/null # Reload sysctl without error messages if no changes applied
+	
+	# 3. Remove configuration files and backups
+	echo "Removing WireGuard configuration files and backups..."
+	rm -f /etc/wireguard/wg*.conf /etc/wireguard/wg*.bak.*
+	rm -rf "$CLIENT_DIR" # Remove client files directory
+	
+	# 4. Purge package
+	echo "Purging wireguard package..."
+	apt autoremove --purge wireguard -y
+	
+	echo -e "\n--- WireGuard Uninstallation Complete ---"
+	echo "The server has been returned to its pre-setup state (minus general system updates)."
+	exit 0
+}
+
+# Function to handle IPv6 configuration
+handle_ipv6_config() {
+	echo -e "\n[3/12] IPv6 Configuration..."
+	read -r -p "Do you want to enable IPv6 routing for the VPN? (y/N): " DO_IPV6
+	
+	if [[ "$DO_IPV6" =~ ^[Yy]$ ]]; then
+		ENABLE_IPV6=true
+		
+		# User prompt for custom prefix
+		DEFAULT_IPV6_PREFIX="fd00:a4a4:0001"
+		read -r -p "Enter the first three octets of the internal IPv6 subnet (e.g., fd00:1111:2222) [Default: $DEFAULT_IPV6_PREFIX]. Must use hexadecimal (0-9, a-f): " IPV6_PREFIX_INPUT
+
+		# Use default if blank
+		WG_IPV6_PREFIX="${IPV6_PREFIX_INPUT:-$DEFAULT_IPV6_PREFIX}"
+
+		# Construct the final IPv6 addresses based on the prefix
+		WG_IPV6_SUBNET="${WG_IPV6_PREFIX}::/64"
+		WG_IPV6_IP="${WG_IPV6_PREFIX}::1/64"
+		FIRST_CLIENT_IPV6="${WG_IPV6_PREFIX}::2"
+		
+		echo "IPv6 routing enabled. Subnet: $WG_IPV6_SUBNET"
+	else
+		ENABLE_IPV6=false
+		echo "IPv6 routing will be skipped."
+	fi
+}
+
+# Function to generate the first client config
+generate_first_client_config() {
+	echo -e "\n======================================================="
+	echo " 	[OPTIONAL] Generate First Client Configuration"
+	echo "======================================================="
+	read -r -p "Do you want to generate the first client config file now? (y/N): " DO_GENERATE
+	
+	if [[ "$DO_GENERATE" =~ ^[Yy]$ ]]; then
+		
+		read -r -p "Enter a name for this client (e.g., 'phone', 'laptop'): " CLIENT_NAME
+		
+		if [[ -z "$CLIENT_NAME" ]]; then
+			CLIENT_NAME="client"
+		fi
+
+		echo -e "\nGenerating key pair for client: $CLIENT_NAME"
+		local CLIENT_PRIVATE_KEY=$(wg genkey)
+		local CLIENT_PUBLIC_KEY=$(echo "$CLIENT_PRIVATE_KEY" | wg pubkey)
+		
+		# Configure addresses and allowed IPs based on IPv6 state
+		local CLIENT_ADDRESS_LINE="${FIRST_CLIENT_IP}/32"
+		local CLIENT_DNS_LINE="8.8.8.8"
+		local CLIENT_ALLOWED_IPS="0.0.0.0/0"
+		local SERVER_PEER_ALLOWED_IPS="${FIRST_CLIENT_IP}/32"
+		
+		if $ENABLE_IPV6; then
+			CLIENT_ADDRESS_LINE="${CLIENT_ADDRESS_LINE}, ${FIRST_CLIENT_IPV6}/128"
+			CLIENT_DNS_LINE="${CLIENT_DNS_LINE}, 2001:4860:4860::8888"
+			CLIENT_ALLOWED_IPS="${CLIENT_ALLOWED_IPS}, ::/0"
+			SERVER_PEER_ALLOWED_IPS="${SERVER_PEER_ALLOWED_IPS}, ${FIRST_CLIENT_IPV6}/128"
+		fi
+
+		# 1. Capture the full client config into a variable for display/QR/save
+		local CLIENT_CONFIG
+		CLIENT_CONFIG="[Interface]
+PrivateKey = $CLIENT_PRIVATE_KEY
+Address = $CLIENT_ADDRESS_LINE
+DNS = $CLIENT_DNS_LINE
+
+[Peer]
+PublicKey = $SERVER_PUBLIC_KEY
+Endpoint = $SERVER_ENDPOINT:$WG_PORT
+AllowedIPs = $CLIENT_ALLOWED_IPS
+PersistentKeepalive = 25"
+		
+		# 2. Add the Peer to the Server Configuration
+		echo "Adding client peer to server config: $CONFIG_FILE"
+		echo -e "\n# Client $CLIENT_NAME added on $(date +%Y-%m-%d %H:%M)" >> "$CONFIG_FILE"
+		cat << EOF >> "$CONFIG_FILE"
+[Peer]
+# Client IPs: $SERVER_PEER_ALLOWED_IPS
+PublicKey = $CLIENT_PUBLIC_KEY
+AllowedIPs = $SERVER_PEER_ALLOWED_IPS
+EOF
+
+		# 3. Get Output Method Choice (New Interactive Step)
+		echo -e "\n--- Client Output Method ---"
+		echo "How would you like to receive the client configuration?"
+		echo "1) Display configuration text in the terminal (Most Secure)"
+		echo "2) Generate QR Code (Best for mobile import, requires 'qrencode')"
+		echo "3) Save file to server disk (Least Secure - MUST delete after transfer)"
+		read -r -p "Enter choice (1-3): " OUTPUT_CHOICE
+
+		case "$OUTPUT_CHOICE" in
+			1)
+				echo -e "\n=================================================================================="
+				echo "  [CLIENT CONFIGURATION FOR: $CLIENT_NAME - COPY BELOW]"
+				echo "  >> This private key was NOT saved to the server's disk. <<"
+				echo "=================================================================================="
+				printf "%s\n" "$CLIENT_CONFIG"
+				echo "=================================================================================="
+				;;
+			2)
+				if ! command -v qrencode &> /dev/null; then
+					echo "Error: 'qrencode' is not installed. Please install it using 'sudo apt install qrencode' (already included in step 4)."
+					return
+				fi
+				echo -e "\n=================================================================================="
+				echo "  [QR CODE FOR: $CLIENT_NAME - SCAN NOW]"
+				echo "=================================================================================="
+				printf "%s" "$CLIENT_CONFIG" | qrencode -t ansiutf8
+				echo "=================================================================================="
+				;;
+			3)
+				# File saving logic
+				mkdir -p "$CLIENT_DIR"
+				chown "$ORIGINAL_USER":"$ORIGINAL_USER" "$CLIENT_DIR" 2>/dev/null
+				CLIENT_FILE="${CLIENT_DIR}/${CLIENT_NAME}.conf"
+
+				printf "%s" "$CLIENT_CONFIG" > "$CLIENT_FILE"
+				chown "$ORIGINAL_USER":"$ORIGINAL_USER" "$CLIENT_FILE" 2>/dev/null
+				
+				# Display QR code for immediate use (UX addition)
+				if command -v qrencode &> /dev/null; then
+					echo -e "\n=================================================================================="
+					echo "  [QR CODE FOR: $CLIENT_NAME - SCAN NOW]"
+					echo "=================================================================================="
+					printf "%s" "$CLIENT_CONFIG" | qrencode -t ansiutf8
+				else
+					echo "Note: qrencode not installed. Outputting text file only."
+				fi
+
+				echo -e "\n=================================================================================="
+				echo "  [SECURITY WARNING: FILE SAVED]"
+				echo "  File saved to: $(pwd)/$CLIENT_FILE"
+				echo "  OWNER: $ORIGINAL_USER"
+				echo "  >> You MUST transfer this file to your client device and DELETE it from the server immediately. <<"
+				echo "=================================================================================="
+				;;
+			*)
+				echo "Invalid choice. Skipping output."
+				;;
+		esac
+		
+		# 4. Reload WireGuard
+		echo "Reloading WireGuard service to activate new client..."
+		systemctl reload wg-quick@${WG_INTERFACE} 2>/dev/null
+		
+	else
+		echo -e "\nSkipping initial client configuration. You can add clients later using the manual steps below or the client manager script."
+	fi
+}
+
+
+# Function to handle UFW/Firewalld configuration
+configure_firewall() {
+	echo -e "\n[9/12] Checking and configuring local firewall..."
+
+	# --- 1. Check for Firewalld ---
+	if command -v firewall-cmd &> /dev/null; then
+		if systemctl is-active --quiet firewalld; then
+			echo "Firewalld is active. Automatically allowing UDP traffic on port $WG_PORT."
+			
+			# Add the port permanently to the public zone (WireGuard traffic comes in publicly)
+			firewall-cmd --zone=public --add-port=$WG_PORT/udp --permanent 2>/dev/null
+			firewall-cmd --reload 2>/dev/null
+			
+			echo "Firewalld rule added. Run 'sudo firewall-cmd --list-ports' to verify."
+			return
+		fi
+	fi
+	
+	# --- 2. Check for UFW (Fallback) ---
+	if command -v ufw &> /dev/null; then
+		if ufw status | grep -q "Status: active"; then
+			echo "UFW is active. Automatically allowing UDP traffic on port $WG_PORT."
+			ufw allow $WG_PORT/udp comment 'Allow WireGuard VPN'
+			echo "UFW rule added. Run 'sudo ufw status' to verify."
+			return
+		fi
+	fi
+	
+	# --- 3. Neither active ---
+	echo "No active firewall (Firewalld or UFW) detected."
+	echo "If you install or enable a firewall later, remember to open UDP port $WG_PORT manually."
+}
+
+
+# Initial interactive menu
+initial_menu() {
+	echo -e "\n--- WireGuard Exit Node Manager ---"
+	echo "Choose an action:"
+	echo "1) Setup WireGuard Exit Node"
+	echo "2) Uninstall WireGuard (Cleanup and Restore)"
+	echo "3) Exit"
+
+	local choice
+	read -r -p "Enter choice (1-3): " choice
+
+	case "$choice" in
+		1)
+			# Proceed with setup
+			;;
+		2)
+			uninstall
+			;;
+		3)
+			echo "Exiting script."
+			exit 0
+			;;
+		*)
+			echo "Invalid choice. Exiting."
+			exit 1
+			;;
+	esac
+}
+
+
+# --- Main Script Execution ---
+
+check_root
+initial_menu
+get_public_interface # This is only executed if choice 1 is made
+
+# 1. Get Server Public Endpoint
+echo -e "\n[1/12] Gathering Server Details..."
+read -r -p "Enter your server's Public IP or Hostname (e.g., 203.0.113.45 or vpn.example.com): " SERVER_ENDPOINT
+if [[ -z "$SERVER_ENDPOINT" ]]; then
+	echo "Error: Server endpoint cannot be empty. Exiting."
+	exit 1
+fi
+echo "Server Endpoint set to: $SERVER_ENDPOINT"
+
+# 2. Get WireGuard Port
+echo -e "\n[2/12] Setting WireGuard Port..."
+read -r -p "Enter the WireGuard Port (Default: 51820): " WG_PORT_INPUT
+WG_PORT="${WG_PORT_INPUT:-51820}" # Use 51820 if user input is empty
+echo "WireGuard Port set to: $WG_PORT"
+
+# 3. Handle IPv6 Configuration (NEW STEP)
+handle_ipv6_config
+
+# 4. Install WireGuard
+echo -e "\n[4/12] Installing WireGuard..."
+apt update && apt install -y wireguard qrencode ufw # Added qrencode and ufw install
+
+# 5. Key Generation/Import
+handle_key_generation
+
+# 6. Handle Backups (before modification)
+handle_backups
+
+# 7. Enable IP Forwarding
+echo -e "\n[7/12] Enabling IPv4 forwarding..."
+if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+	echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+fi
+if $ENABLE_IPV6; then
+	echo "Enabling IPv6 forwarding..."
+	if ! grep -q "net.ipv6.conf.all.forwarding=1" /etc/sysctl.conf; then
+		echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+	fi
+fi
+sysctl -p
+
+# 8. Configure wg0.conf
+echo -e "\n[8/12] Configuring $CONFIG_FILE..."
+
+# IPTables/NAT Setup (IPv4)
+POST_UP_CMD_V4="iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${PUBLIC_INTERFACE} -j MASQUERADE"
+POST_DOWN_CMD_V4="iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${PUBLIC_INTERFACE} -j MASQUERADE"
+
+# Initialize combined commands with V4 only
+POST_UP_COMBINED="PostUp = $POST_UP_CMD_V4"
+POST_DOWN_COMBINED="PostDown = $POST_DOWN_CMD_V4"
+ADDRESSES_LIST="$WG_IP"
+
+if $ENABLE_IPV6; then
+	# IP6Tables/NAT Setup (IPv6)
+	POST_UP_CMD_V6="ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -A FORWARD -o %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${PUBLIC_INTERFACE} -j MASQUERADE"
+	POST_DOWN_CMD_V6="ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -D FORWARD -o %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${PUBLIC_INTERFACE} -j MASQUERADE"
+	
+	# Append IPv6 to combined commands
+	POST_UP_COMBINED="$POST_UP_COMBINED; $POST_UP_CMD_V6"
+	POST_DOWN_COMBINED="$POST_DOWN_COMBINED; $POST_DOWN_CMD_V6"
+	ADDRESSES_LIST="$ADDRESSES_LIST, $WG_IPV6_IP"
+fi
+
+
+cat << EOF > "$CONFIG_FILE"
+[Interface]
+# Server's private key (securely stored here)
+PrivateKey = $SERVER_PRIVATE_KEY
+# Server's internal IP addresses (IPv4 and conditionally IPv6)
+Address = $ADDRESSES_LIST
+# NAT/Masquerade rules to forward traffic out of the public interface
+$POST_UP_COMBINED
+$POST_DOWN_COMBINED
+# Listen port for WireGuard UDP traffic
+ListenPort = $WG_PORT
+
+# --- Start Client Peer Section ---
+# Client Peers will be automatically added here by the script
+# --- End Client Peer Section ---
+EOF
+
+# Ensure secure permissions for the config file containing the private key
+chmod 600 "$CONFIG_FILE"
+
+# 9. Configure UFW (New Step)
+configure_firewall
+
+# 10. Start WireGuard
+echo -e "\n[10/12] Enabling and starting WireGuard service..."
+systemctl enable wg-quick@${WG_INTERFACE} 2>/dev/null
+systemctl start wg-quick@${WG_INTERFACE}
+if systemctl is-active --quiet wg-quick@${WG_INTERFACE}; then
+	echo "Success: WireGuard interface $WG_INTERFACE is active."
+	wg show $WG_INTERFACE
+else
+	echo "Error: Failed to start WireGuard service. Check logs with 'journalctl -xeu wg-quick@${WG_INTERFACE}'."
+	echo "Note: Installation may require a reboot if the kernel module wasn't loaded immediately."
+	exit 1
+fi
+
+# 11. Run Optional Client Generation
+generate_first_client_config
+
+# 12. Output final instructions
+echo -e "\n--- CRITICAL: External Cloud Firewall ---"
+echo "You MUST manually allow UDP traffic on port $WG_PORT in your Cloud Provider's (Oracle, AWS, etc.)"
+echo "Security List or Network Security Group settings. The script cannot do this for you."
+
+local IPV6_FIREWALL_MSG=""
+if $ENABLE_IPV6; then
+	IPV6_FIREWALL_MSG="and ::/0 (for IPv6)"
+fi
+echo "CIDR to allow: 0.0.0.0/0 (for IPv4) $IPV6_FIREWALL_MSG on UDP port $WG_PORT."
+
+echo -e "\n======================================================="
+echo " 	 	WireGuard Exit Node Manager: MANUAL CLIENT ADDITION DETAILS"
+echo "======================================================="
+echo "Server Public Key:"
+printf "%s\n" "$SERVER_PUBLIC_KEY"
+echo "Server Endpoint: $SERVER_ENDPOINT:$WG_PORT"
+echo "-------------------------------------------------------"
+if $ENABLE_IPV6; then
+	echo "To add more clients manually, use an IPv4 starting from 10.0.0.3/32"
+	echo "AND an IPv6 starting from ${WG_IPV6_PREFIX}::3/128."
+else
+	echo "To add more clients manually, use an IPv4 starting from 10.0.0.3/32."
+fi
+echo "Use the separate client manager script to easily add/remove peers."
+echo "======================================================="
+
+echo "Setup complete. The server configuration is located at $CONFIG_FILE."

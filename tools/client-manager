@@ -1,0 +1,318 @@
+#!/bin/bash
+#
+# WireGuard Client Management Script
+# Designed to complement the setup_wireguard_exit_node.sh script.
+# Manages adding, removing, and listing client peers in /etc/wireguard/wg0.conf.
+# Must be run with 'sudo'.
+
+# --- Configuration Variables ---
+WG_INTERFACE="wg0"
+CONFIG_FILE="/etc/wireguard/${WG_INTERFACE}.conf"
+
+# Client file location (relative to script execution location, owned by non-root user)
+CLIENT_DIR="wg-clients"
+ORIGINAL_USER="${SUDO_USER:-root}"
+
+# --- Helper Functions ---
+
+# Check for root permissions
+check_root() {
+	if [[ $EUID -ne 0 ]]; then
+		echo "Error: This script must be run as root or with sudo."
+		exit 1
+	fi
+}
+
+# Extract server details and check for IPv6 enablement
+get_server_details() {
+	if [ ! -f "$CONFIG_FILE" ]; then
+		echo "Error: WireGuard configuration file not found at $CONFIG_FILE."
+		echo "Please run the setup script first."
+		exit 1
+	fi
+
+	# 1. Check for IPv6 enablement and get the server's IPv6 address
+	SERVER_ADDR_LINE=$(grep '^Address =' "$CONFIG_FILE" | awk '{print $3}')
+	if echo "$SERVER_ADDR_LINE" | grep -q '::1'; then
+		ENABLE_IPV6=true
+		# Extract the custom IPv6 prefix (e.g., fd00:a4a4:0001)
+		WG_IPV6_PREFIX=$(echo "$SERVER_ADDR_LINE" | sed -E 's/(.*)([0-9a-f]{4}:[0-9a-f]{4}:[0-9a-f]{4})(.*)/\2/')
+		# echo "IPv6 routing detected using prefix: $WG_IPV6_PREFIX" # Suppressed for cleaner output
+	else
+		ENABLE_IPV6=false
+		# echo "IPv4-only routing detected." # Suppressed for cleaner output
+	fi
+
+	# 2. Extract Server Public Key and Endpoint
+	SERVER_PUBLIC_KEY=$(grep '^PublicKey =' "$CONFIG_FILE" | head -n 1 | awk '{print $3}')
+	
+	# Try to guess the endpoint from PostUp/PostDown commands (if it was an IP/Hostname, it's NOT here)
+	# Endpoint is usually configured on the client side based on the server's public IP/Port.
+	# We rely on the user knowing the endpoint, but we can extract the port.
+	WG_PORT=$(grep '^ListenPort =' "$CONFIG_FILE" | awk '{print $3}')
+}
+
+# Calculate the next available internal IP addresses for a new client
+get_next_ips() {
+	# Get all existing IPv4 addresses used by peers
+	USED_IPS_V4=$(grep 'AllowedIPs' "$CONFIG_FILE" | grep -oE '10\.0\.0\.[0-9]+' | sort -n -t . -k 4)
+	
+	# Find the highest used IPv4 (default starting point is 10.0.0.1 for server)
+	NEXT_V4_OCTET=2
+	if [ ! -z "$USED_IPS_V4" ]; then
+		HIGHEST_V4=$(echo "$USED_IPS_V4" | tail -n 1 | awk -F '.' '{print $4}')
+		NEXT_V4_OCTET=$((HIGHEST_V4 + 1))
+	fi
+	NEXT_IPV4="10.0.0.${NEXT_V4_OCTET}"
+
+	# If IPv6 is enabled, calculate the next IPv6
+	if $ENABLE_IPV6; then
+		# Get all existing IPv6 addresses used by peers (e.g., ::2, ::3)
+		USED_IPS_V6=$(grep 'AllowedIPs' "$CONFIG_FILE" | grep -oE '::[0-9]+' | sort -n -t : -k 3)
+		
+		# Find the highest used IPv6 suffix
+		NEXT_V6_SUFFIX=2
+		if [ ! -z "$USED_IPS_V6" ]; then
+			HIGHEST_V6_SUFFIX=$(echo "$USED_IPS_V6" | tail -n 1 | sed 's/:://')
+			NEXT_V6_SUFFIX=$((HIGHEST_V6_SUFFIX + 1))
+		fi
+		NEXT_IPV6="${WG_IPV6_PREFIX}::${NEXT_V6_SUFFIX}"
+	else
+		NEXT_IPV6=""
+	fi
+}
+
+# --- Main Functions ---
+
+add_client() {
+	echo -e "\n--- Add New WireGuard Client ---\n"
+	
+	read -r -p "Enter a name for the new client (e.g., 'work-phone'): " CLIENT_NAME
+	if [[ -z "$CLIENT_NAME" ]]; then
+		echo "Client name cannot be empty. Aborting."
+		return
+	fi
+
+	get_next_ips
+	local CONF_BASENAME="${CLIENT_NAME}.conf"
+
+	echo -e "\nAssigning IPs:"
+	echo "  IPv4: ${NEXT_IPV4}/32"
+	if $ENABLE_IPV6; then
+		echo "  IPv6: ${NEXT_IPV6}/128"
+	fi
+	
+	# 1. Generate Client Key Pair
+	echo -e "\nGenerating key pair for client: $CLIENT_NAME"
+	local CLIENT_PRIVATE_KEY=$(wg genkey)
+	local CLIENT_PUBLIC_KEY=$(echo "$CLIENT_PRIVATE_KEY" | wg pubkey)
+	
+	# 2. Configure Address lines
+	local CLIENT_ADDRESS_LINE="${NEXT_IPV4}/32"
+	local CLIENT_DNS_LINE="8.8.8.8"
+	local CLIENT_ALLOWED_IPS="0.0.0.0/0"
+	local SERVER_PEER_ALLOWED_IPS="${NEXT_IPV4}/32"
+
+	if $ENABLE_IPV6; then
+		CLIENT_ADDRESS_LINE="${CLIENT_ADDRESS_LINE}, ${NEXT_IPV6}/128"
+		CLIENT_DNS_LINE="${CLIENT_DNS_LINE}, 2001:4860:4860::8888"
+		CLIENT_ALLOWED_IPS="${CLIENT_ALLOWED_IPS}, ::/0"
+		SERVER_PEER_ALLOWED_IPS="${SERVER_PEER_ALLOWED_IPS}, ${NEXT_IPV6}/128"
+	fi
+
+	# 3. Capture the full client config into a variable for display/QR/save
+	local CLIENT_CONFIG
+	CLIENT_CONFIG="[Interface]
+PrivateKey = $CLIENT_PRIVATE_KEY
+Address = $CLIENT_ADDRESS_LINE
+DNS = $CLIENT_DNS_LINE
+
+[Peer]
+PublicKey = $SERVER_PUBLIC_KEY
+Endpoint = <ENTER_SERVER_ENDPOINT>:$WG_PORT 
+# NOTE: Replace <ENTER_SERVER_ENDPOINT> with your server's Public IP or Hostname.
+AllowedIPs = $CLIENT_ALLOWED_IPS
+PersistentKeepalive = 25"
+	
+	# 4. Add Peer to Server Config (REQUIRED - happens regardless of output method)
+	echo "Adding peer block to server config: $CONFIG_FILE"
+	echo -e "\n# Client $CLIENT_NAME added on $(date +%Y-%m-%d %H:%M)" >> "$CONFIG_FILE"
+	cat << EOF >> "$CONFIG_FILE"
+[Peer]
+# Client IPs: $SERVER_PEER_ALLOWED_IPS
+PublicKey = $CLIENT_PUBLIC_KEY
+AllowedIPs = $SERVER_PEER_ALLOWED_IPS
+EOF
+
+	# 5. Get Output Method Choice
+	echo -e "\n--- Client Output Method ---"
+	echo "How would you like to receive the client configuration?"
+	echo "1) Display configuration text in the terminal (Most Secure)"
+	echo "2) Generate QR Code (Best for mobile import, requires 'qrencode')"
+	echo "3) Save file to server disk (Least Secure - MUST delete after transfer)"
+	read -r -p "Enter choice (1-3): " OUTPUT_CHOICE
+
+	case "$OUTPUT_CHOICE" in
+		1)
+			echo -e "\n=================================================================================="
+			echo "  [CLIENT CONFIGURATION FOR: $CLIENT_NAME - COPY BELOW]"
+			echo "  >> This private key was NOT saved to the server's disk. <<"
+			echo "=================================================================================="
+			printf "%s\n" "$CLIENT_CONFIG"
+			echo "=================================================================================="
+			;;
+		2)
+			echo -e "\n=================================================================================="
+			echo "  [QR CODE FOR: $CLIENT_NAME - SCAN NOW]"
+			echo "  (Requires 'qrencode' to be installed on the server)"
+			echo "=================================================================================="
+			# Use printf to avoid extra newlines being encoded
+			printf "%s" "$CLIENT_CONFIG" | qrencode -t ansiutf8
+			echo "=================================================================================="
+			;;
+		3)
+			# File saving logic
+			mkdir -p "$CLIENT_DIR"
+			chown "$ORIGINAL_USER":"$ORIGINAL_USER" "$CLIENT_DIR" 2>/dev/null
+			CLIENT_FILE="${CLIENT_DIR}/${CLIENT_NAME}.conf"
+
+			printf "%s" "$CLIENT_CONFIG" > "$CLIENT_FILE"
+			chown "$ORIGINAL_USER":"$ORIGINAL_USER" "$CLIENT_FILE" 2>/dev/null
+			
+			# Display QR code for immediate use (New UX addition)
+			echo -e "\n=================================================================================="
+			echo "  [QR CODE FOR: $CLIENT_NAME - SCAN NOW]"
+			echo "  (Requires 'qrencode' to be installed on the server)"
+			echo "=================================================================================="
+			printf "%s" "$CLIENT_CONFIG" | qrencode -t ansiutf8
+
+			echo -e "\n=================================================================================="
+			echo "  [SECURITY WARNING: FILE SAVED]"
+			echo "  File saved to: $(pwd)/$CLIENT_FILE"
+			echo "  OWNER: $ORIGINAL_USER"
+			echo "  >> You MUST transfer this file to your client device and DELETE it from the server immediately. <<"
+			echo "=================================================================================="
+			;;
+		*)
+			echo "Invalid choice. Skipping output."
+			;;
+	esac
+
+	# 6. Reload WireGuard
+	echo -e "\nReloading WireGuard service..."
+	systemctl reload wg-quick@${WG_INTERFACE} 2>/dev/null
+	
+	echo -e "\nSUCCESS! Client '$CLIENT_NAME' has been added to the server and the service was reloaded."
+	echo "-------------------------------------------------------"
+}
+
+remove_client() {
+	echo -e "\n--- Remove WireGuard Client ---"
+	list_clients
+
+	read -r -p "Enter the public key of the client to REMOVE (Copy the full key): " KEY_TO_REMOVE
+	if [[ -z "$KEY_TO_REMOVE" ]]; then
+		echo "No key entered. Aborting."
+		return
+	fi
+
+	# Escape the key for use in sed
+	ESCAPED_KEY=$(echo "$KEY_TO_REMOVE" | sed 's/[\/&]/\\&/g')
+
+	# Check if the key exists in the config file
+	if ! grep -q "$KEY_TO_REMOVE" "$CONFIG_FILE"; then
+		echo "Error: Key not found in $CONFIG_FILE. Aborting."
+		return
+	fi
+
+	echo -e "\nRemoving peer with key $KEY_TO_REMOVE from $CONFIG_FILE..."
+	
+	# Identify the start and end line of the peer block
+	START_LINE=$(grep -n "$ESCAPED_KEY" "$CONFIG_FILE" | awk -F: '{print $1}')
+	if [ -z "$START_LINE" ]; then
+		echo "Failed to find the key's location. Aborting."
+		return
+	fi
+	
+	# Find the line number of the preceding [Peer] or the top of the file
+	PREV_PEER_LINE=$(awk -v start="$START_LINE" 'NR < start && /^\[Peer\]/ {last_peer_line=NR} END {print last_peer_line}' "$CONFIG_FILE")
+	
+	# If no preceding [Peer] is found, assume we start near the found key.
+	if [ -z "$PREV_PEER_LINE" ]; then
+		# Try to find the start of the block by looking for the closest preceding comment/Peer tag
+		BLOCK_START_LINE=$(awk -v start="$START_LINE" 'NR < start && (/^# Client/ || /^\[Peer\]/) {last_start=NR} END {print last_start}' "$CONFIG_FILE")
+		BLOCK_START_LINE=${BLOCK_START_LINE:-$((START_LINE - 3))} # Fallback if block start isn't marked
+	else
+		BLOCK_START_LINE=$PREV_PEER_LINE
+	fi
+	
+	# Find the line number of the next [Peer] or end of file
+	NEXT_PEER_LINE=$(awk -v start="$START_LINE" 'NR > start && /^\[Peer\]/ {print NR; exit}' "$CONFIG_FILE")
+	
+	# Define the end line for deletion
+	if [ ! -z "$NEXT_PEER_LINE" ]; then
+		# Delete until the line before the next [Peer]
+		END_LINE=$((NEXT_PEER_LINE - 1))
+	else
+		# Delete until the end of the file
+		END_LINE=$(wc -l < "$CONFIG_FILE")
+	fi
+	
+	# Delete the block using sed (delete from BLOCK_START_LINE to END_LINE)
+	sed -i "${BLOCK_START_LINE},${END_LINE}d" "$CONFIG_FILE"
+
+	# Reload WireGuard
+	echo "Peer removed. Reloading WireGuard service..."
+	systemctl reload wg-quick@${WG_INTERFACE} 2>/dev/null
+	
+	echo -e "\nSUCCESS: Peer removal complete. Don't forget to delete the client's local .conf file."
+}
+
+list_clients() {
+	echo -e "\n--- Active WireGuard Peers ---"
+	if systemctl is-active --quiet wg-quick@${WG_INTERFACE}; then
+		# Show active peers using the wg command
+		wg show ${WG_INTERFACE} peers | while read -r peer; do
+			# Get the public key
+			PUBLIC_KEY=$(echo "$peer" | awk '{print $1}')
+			
+			# Get the AllowedIPs/Client IP from the config file (more reliable than 'wg show' for client IP)
+			CLIENT_IP_LINE=$(grep -B 10 "$PUBLIC_KEY" "$CONFIG_FILE" | grep 'AllowedIPs' | awk '{print $3}')
+			
+			echo "--------------------------------------------------------"
+			echo "Key: $PUBLIC_KEY"
+			echo "Client IPs (Internal): $CLIENT_IP_LINE"
+		done
+		echo "--------------------------------------------------------"
+		echo "Total Active Peers: $(wg show ${WG_INTERFACE} | grep peer | wc -l)"
+	else
+		echo "WireGuard service is not currently active. Cannot list live peers."
+		echo "You can check configuration peers in $CONFIG_FILE."
+	fi
+}
+
+# --- Main Execution ---
+
+check_root
+get_server_details
+
+while true; do
+	echo -e "\n======================================================="
+	echo " WireGuard Client Manager for Interface $WG_INTERFACE"
+	echo " Server Port: $WG_PORT | IPv6 Enabled: $ENABLE_IPV6"
+	echo "======================================================="
+	echo "1) Add New Client Peer"
+	echo "2) Remove Existing Client Peer"
+	echo "3) List Active Client Peers"
+	echo "4) Exit"
+	
+	read -r -p "Enter choice (1-4): " CHOICE
+	
+	case "$CHOICE" in
+		1) add_client ;;
+		2) remove_client ;;
+		3) list_clients ;;
+		4) echo "Exiting client manager." ; break ;;
+		*) echo "Invalid choice. Please enter 1, 2, 3, or 4." ;;
+	esac
+done
