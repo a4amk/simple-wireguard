@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 a4amk
 #
 # WireGuard Client Management Script
 # Designed to complement the setup_wireguard_exit_node.sh script.

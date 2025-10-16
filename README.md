@@ -8,7 +8,7 @@ To set up your WireGuard exit node, clone the repository and run the `main` scri
 
 ```bash
 git clone https://github.com/a4amk/simple-wireguard.git
-cd simple-wireguard
+cd simple-wireguard && sudo chmod +x main
 sudo ./main
 ```
 
